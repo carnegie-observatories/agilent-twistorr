@@ -1,0 +1,9 @@
+[project]
+name = "agilent-twistorr"
+version = "0.1.0"
+description = "Agilent TwisTorr 305 FS turbo molecular pump controller interface"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "psycopg2-binary>=2.9.10",
+]
