@@ -1,4 +1,5 @@
 import socket
+import time
 
 stx = b"\x02"
 address = {"rs232": b"\x80"}
@@ -75,9 +76,21 @@ etx = b"\x03"  # end of transmission
 
 class TwisTorr:
 
-    def open(self, ip, port=8899):
+    def open(self, ip, port=8899, cmd_delay=0.1):
+        self.close()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(5.0)
         self.sock.connect((ip, port))
+        self._cmd_delay = cmd_delay
+
+    def close(self):
+        sock = getattr(self, "sock", None)
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            self.sock = None
 
     def calculate_crc(self, message):
         """Calculate CRC for Edwards pump protocol message.
@@ -121,9 +134,9 @@ class TwisTorr:
         Returns:
             Decoded components: address, window, command, data, crc
         """
-        if message[0] != stx[0] or message[-3] != etx[0]:
-            raise ValueError("Invalid message format")
-        
+        if len(message) < 8 or message[0] != stx[0] or message[-3] != etx[0]:
+            raise ValueError(f"Invalid message format: {message!r}")
+
         address = message[1:2]
         window = message[2:5]
         command = message[5:6]
@@ -132,25 +145,86 @@ class TwisTorr:
 
         calculated_crc = self.calculate_crc(message[1:-2])
         if crc != calculated_crc:
-            raise ValueError("CRC mismatch")
-        
+            raise ValueError(f"CRC mismatch: {message!r}")
+
         return address, window, command, data, crc
+
+    def _recv_frame(self):
+        """Read one complete STX..ETX+CRC frame from the socket.
+
+        Skips bytes until STX, then reads until ETX followed by the 2-byte CRC.
+        If another STX appears mid-frame, the current frame is corrupted (serial
+        collision from the bridge multiplexing multiple clients onto one serial
+        line).  Discard the partial frame and restart from the new STX.
+        """
+        buf = bytearray()
+        # Phase 1: find STX
+        while True:
+            b = self.sock.recv(1)
+            if not b:
+                raise ConnectionError("Pump closed connection")
+            if b[0] == stx[0]:
+                buf = bytearray(b)
+                break
+        # Phase 2: read body until ETX + 2-byte CRC
+        while True:
+            b = self.sock.recv(1)
+            if not b:
+                raise ConnectionError("Pump closed connection mid-frame")
+            if b[0] == stx[0]:
+                # Embedded STX = serial collision; restart frame
+                buf = bytearray(b)
+                continue
+            buf += b
+            if len(buf) > 128:
+                raise ValueError(f"Frame too large, likely framing error: {buf[:20]!r}...")
+            if len(buf) >= 4 and buf[-3] == etx[0]:
+                return bytes(buf)
 
     def get_window_description(self, window):
         return window_rev.get(window, "Unknown window")
 
-    def read(self, cmd):
+    def read(self, cmd, max_retries=3):
         """Send command to pump and read response.
         Args:
-            cmd: Command bytes to send
-        Returns:            Decoded response message
+            cmd: Command name string
+            max_retries: Number of times to resend the command if no matching
+                response arrives (each attempt reads up to 16 frames).
+        Returns:
+            Decoded response tuple (address, window, command, data, crc)
         """
-        aux = self.encode_message(address["rs232"], window[cmd], command["read"])
-        self.sock.sendall(aux)
-        response = self.sock.recv(1024)
-        if not response:
-            print("No response received from pump.")
-        return self.decode_message(response)
+        expected_window = window[cmd]
+        aux = self.encode_message(address["rs232"], expected_window, command["read"])
+
+        for _ in range(max_retries):
+            time.sleep(self._cmd_delay)
+            self._drain_stale()
+            self.sock.sendall(aux)
+
+            for _ in range(16):
+                frame = self._recv_frame()
+                try:
+                    decoded = self.decode_message(frame)
+                except ValueError:
+                    continue
+                if decoded[1] != expected_window:
+                    continue
+                return decoded
+            # Response lost (collision or consumed by another client); resend
+        raise TimeoutError(f"No matching response for window {expected_window!r} after {max_retries} retries")
+
+    def _drain_stale(self):
+        """Discard any unread bytes sitting in the socket buffer before sending."""
+        self.sock.setblocking(False)
+        try:
+            while True:
+                chunk = self.sock.recv(1024)
+                if not chunk:
+                    break
+        except BlockingIOError:
+            pass
+        finally:
+            self.sock.setblocking(True)
 
     def test_message_encoding(self):
         # print(get_message(address["rs232"], window["PUMP STATUS"], command["read"]))

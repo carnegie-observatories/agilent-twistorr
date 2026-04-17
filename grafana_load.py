@@ -86,8 +86,17 @@ while True:
     except Exception as e:
         print(f"Error reading data: {e}")
         time.sleep(LOOP_INTERVAL * 3)
+        if pump:
+            pump.close()
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
         pump, db = None, None  # Force reconnect on error
         continue
     except KeyboardInterrupt:
         print("Exiting...")
+        if pump:
+            pump.close()
         break
